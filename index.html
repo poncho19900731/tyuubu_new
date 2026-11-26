@@ -1,0 +1,1076 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="路線踏査">
+<title>路線踏査アプリ・5m車線記録</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font-family:system-ui,sans-serif}
+body{display:flex;flex-direction:column;height:100dvh;background:#fff}
+header{padding:7px;max-height:57dvh;overflow:auto;background:#f4f5f6}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin-bottom:5px}
+button,input{font:inherit}
+button{min-height:38px;padding:5px 9px;border:1px solid #a8adb4;border-radius:6px;background:#fff;color:#17202a;font-size:13px;touch-action:manipulation}
+button:disabled{opacity:.42}
+button[aria-pressed="true"]{background:#145d9e;color:#fff;border-color:#145d9e}
+#start,#finish,#checkpoint{color:#fff;border:0}
+#start{background:#237842}
+#finish{background:#b82525}
+#checkpoint{background:#006b70}
+#counts,#lanes{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;width:100%;max-width:430px}
+#counts>strong,#lanes>strong{grid-column:1/-1}
+#counts>button,#lanes>button{width:100%;min-width:0;min-height:44px;padding:5px 2px;white-space:nowrap}
+#roadStatus{font-size:16px;font-weight:750}
+#message,#gpsStatus,#saveStatus{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+#message{color:#29354a}
+#gpsStatus{color:#985300}
+#saveStatus{color:#006b70}
+#map{flex:1;min-height:0}
+#follow{position:fixed;right:10px;bottom:max(25px,env(safe-area-inset-bottom));z-index:1000;border-radius:20px}
+.route-label{background:#fff;border:2px solid;border-radius:999px;text-align:center;font-size:12px;font-weight:750;line-height:24px}
+.dot{width:17px;height:17px;border:3px solid #fff;border-radius:50%;background:#dc2626;box-shadow:0 0 0 2px #dc262688}
+#panel{position:fixed;inset:auto 0 0;height:47%;z-index:1100;background:#fff;border-top:2px solid #145d9e;padding:6px;display:flex;flex-direction:column}
+#tableArea{overflow:auto;flex:1}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{border:1px solid #d2d5d8;padding:4px;white-space:nowrap}
+th{position:sticky;top:0;background:#eef0f3}
+dialog{width:min(94vw,540px);max-height:85dvh;overflow:auto;border:0;border-radius:10px;padding:15px}
+dialog h2{font-size:18px;margin:0 0 8px}
+dialog::backdrop{background:#0008}
+#historyChoices{max-height:40dvh;overflow:auto;border-block:1px solid #ddd;margin:8px 0}
+#historyChoices label{display:flex;gap:8px;align-items:center;padding:9px 2px;border-bottom:1px solid #eee}
+#historyChoices input{width:18px;height:18px;flex:none}
+#pat{width:100%;font-size:16px;margin:6px 0}
+#downloads a{font-size:13px;padding:5px}
+[hidden]{display:none!important}
+</style>
+</head>
+
+<body>
+<header id="header">
+  <div class="row">
+    <button id="start" disabled>調査開始</button>
+    <button id="finish" disabled>調査終了</button>
+    <button id="checkpoint" disabled>途中保存</button>
+    <button id="listButton">経路一覧</button>
+  </div>
+
+  <div class="row" id="counts" role="group" aria-label="車線数">
+    <strong>車線数（片側）</strong>
+    <button data-mode="oneway" aria-pressed="false">片道</button>
+    <button data-mode="1" aria-pressed="true">1車線</button>
+    <button data-mode="2" aria-pressed="false">2車線</button>
+    <button data-mode="3" aria-pressed="false">3車線</button>
+    <button data-mode="4" aria-pressed="false">4車線</button>
+  </div>
+
+  <div class="row" id="lanes" role="group" aria-label="通過車線番号">
+    <strong>車線No.</strong>
+    <button data-lane="1" aria-pressed="false">1</button>
+    <button data-lane="2" aria-pressed="false" disabled>2</button>
+    <button data-lane="3" aria-pressed="false" disabled>3</button>
+    <button data-lane="4" aria-pressed="false" disabled>4</button>
+  </div>
+
+  <div id="roadStatus" aria-live="polite">路線を読み込み中…</div>
+  <div id="gpsStatus"></div>
+  <div id="saveStatus" aria-live="polite"></div>
+  <div id="message" aria-live="polite"></div>
+
+  <div class="row">
+    <button id="construction" disabled>工事 開始</button>
+    <button id="detour" disabled>迂回 開始</button>
+    <button id="history" disabled>色塗りの引き継ぎ</button>
+    <button id="tokenSettings">トークン入力</button>
+  </div>
+
+  <div class="row" id="recovery" hidden>
+    <button id="resume">前回の調査を再開</button>
+    <button id="discard">途中記録を破棄</button>
+  </div>
+  <div class="row" id="downloads"></div>
+</header>
+
+<div id="map"></div>
+<button id="follow" aria-pressed="false">現在地追従：OFF</button>
+
+<section id="panel" hidden aria-label="経路一覧">
+  <div class="row">
+    <span id="summary"></span>
+    <button id="exportList">経路一覧Excel</button>
+    <button id="closeList">閉じる</button>
+  </div>
+  <div id="tableArea"></div>
+</section>
+
+<dialog id="historyDialog">
+  <h2>前回までの色塗りを引き継ぎますか？</h2>
+  <p>表示したい調査を選んでください。過去の経路・時刻は今回の記録に追加しません。</p>
+  <div id="historyChoices"></div>
+  <div class="row">
+    <button id="applyHistory">選んだ色塗りを引き継ぐ</button>
+    <button id="fresh">引き継がない</button>
+  </div>
+</dialog>
+
+<dialog id="reasonDialog">
+  <form method="dialog">
+    <h2>迂回の理由</h2>
+    <button value="路駐">路駐</button>
+    <button value="工事">工事</button>
+    <button value="">キャンセル</button>
+  </form>
+</dialog>
+
+<dialog id="tokenDialog">
+  <form method="dialog">
+    <h2>GitHubトークン</h2>
+    <label for="pat">保存先リポジトリへの書き込み用トークン</label>
+    <input id="pat" type="password" autocomplete="off" autocapitalize="none" spellcheck="false">
+    <p>トークンはページのメモリだけに保持します。再読み込みすると消えます。</p>
+    <button value="set">このページで使う</button>
+    <button value="clear">消去</button>
+    <button value="">キャンセル</button>
+  </form>
+</dialog>
+
+<script>
+'use strict';
+
+// GitHubへの保存先。ローカル保存だけならトークン入力は不要。
+const OWNER='poncho19900731', REPO='tyuubu_new', BRANCH='main', FOLDER='results';
+
+// 車線枠・色塗り・出力の区間単位はすべて5m。
+const UNIT=5;
+const DB_NAME=`road-lanes-v2-5m-${OWNER}-${REPO}`;
+const NEAR=15, MAX_ACCURACY=25, MAX_GAP=15000, ROUTE_MARGIN=5;
+const DIR_MOVE=3, DIR_STREAK=2, DIR_DISTANCE=8;
+const MAX_JUMP=150, MAX_SPEED=45, LANE_WIDTH=3.1, LABEL_INTERVAL=1000;
+const COLORS=['#227b40','#365bd8','#b63783','#c2610b','#6d43bb','#00838c','#89521f','#546b16'];
+const ZONES={
+  construction:{name:'工事',color:'#875944',kml:'ff445987'},
+  detour:{name:'迂回',color:'#e88b19',kml:'ff198be8'}
+};
+
+const $=id=>document.getElementById(id);
+const msg=s=>{$('message').textContent=s;};
+const ll=p=>[p[1],p[0]];
+const meters={units:'meters'};
+const xml=s=>String(s).replace(/[&<>"']/g,c=>({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'
+}[c]));
+const pad=n=>String(n).padStart(2,'0');
+const when=t=>t?new Date(t).toLocaleString('ja-JP'):'';
+const modeName=m=>m==='oneway'?'片道':`片側${m}車線`;
+const dirName=d=>({F:'往路',R:'復路',O:'片道'})[d]||'方向判定中';
+function stamp(t){
+  const d=new Date(t);
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+const routes=[],routeById=new Map(),inherited=new Map(),painted=new Map();
+let mode='1',lane=0,job=null,activeZone=null,latest=null,previous=null,dirState=null;
+let history=[],selected=new Set(),recovered=null,pending=null,volatileResult=null;
+let watchId=null,watchEpoch=0,wake=null,follow=false,marker=null,accuracyCircle=null;
+let ready=false,busy=false,dirty=false,token='',settingsVersion=0;
+let trackLine=null,activePaths={},downloadURLs=[];
+let db,writes=Promise.resolve();
+
+const map=L.map('map',{preferCanvas:true}).setView([24.78,125.33],11);
+for(const [name,z] of Object.entries({roads:410,tracks:420,lanes:440,highlight:445,zones:455,labels:500,position:560})){
+  map.createPane(name).style.zIndex=z;
+}
+const tile=(name,ext='png')=>L.tileLayer(
+  `https://cyberjapandata.gsi.go.jp/xyz/${name}/{z}/{x}/{y}.${ext}`,
+  {attribution:'地理院タイル',maxNativeZoom:18,maxZoom:22}
+);
+const bases={'淡色地図':tile('pale'),'標準地図':tile('std'),'航空写真':tile('seamlessphoto','jpg')};
+bases['淡色地図'].addTo(map);
+L.control.layers(bases).addTo(map);
+const laneLayer=L.layerGroup().addTo(map);
+const tracks=L.layerGroup().addTo(map);
+const zones=L.layerGroup().addTo(map);
+const currentLane=L.layerGroup().addTo(map);
+if(window.ResizeObserver) new ResizeObserver(()=>map.invalidateSize()).observe($('header'));
+
+function openDB(){
+  return new Promise((resolve,reject)=>{
+    const r=indexedDB.open(DB_NAME,1);
+    r.onupgradeneeded=()=>{
+      r.result.createObjectStore('meta');
+      r.result.createObjectStore('surveys',{keyPath:'id'});
+    };
+    r.onsuccess=()=>resolve(r.result);
+    r.onerror=()=>reject(r.error);
+    r.onblocked=()=>reject(new Error('別の画面で保存領域を使用しています'));
+  });
+}
+function dbRead(store,key){
+  return new Promise((resolve,reject)=>{
+    const s=db.transaction(store).objectStore(store);
+    const r=key===undefined?s.getAll():s.get(key);
+    r.onsuccess=()=>resolve(r.result);
+    r.onerror=()=>reject(r.error);
+  });
+}
+function dbWrite(stores,fn){
+  const task=writes.then(()=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(stores,'readwrite');
+    tx.oncomplete=resolve;
+    tx.onabort=()=>reject(tx.error||new Error('端末保存に失敗しました'));
+    try{fn(tx);}catch(e){tx.abort();reject(e);}
+  }));
+  writes=task.catch(()=>{});
+  return task;
+}
+
+async function readText(url){
+  const res=await fetch(url,{cache:'no-store'});
+  if(!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.text()).replace(/^\uFEFF/,'');
+}
+function parseKml(source,file){
+  const doc=new DOMParser().parseFromString(source,'application/xml');
+  if(doc.querySelector('parsererror')) throw new Error('KMLの形式が不正です');
+  const parts=[];
+  for(const mark of doc.getElementsByTagNameNS('*','Placemark')){
+    const fallback=file.split('/').pop().replace(/\.kml$/i,'');
+    const name=[...mark.children].find(n=>n.localName==='name')?.textContent.trim()||fallback;
+    const route=name.normalize('NFKC').replace(/\(way\s*\d+\)/gi,'').trim()
+      .replace(/_\d+$/,'').trim()||fallback;
+    for(const line of mark.getElementsByTagNameNS('*','LineString')){
+      const raw=line.getElementsByTagNameNS('*','coordinates')[0]?.textContent.trim()||'';
+      if(!raw) continue;
+      const c=raw.split(/\s+/).map(s=>{
+        const v=s.split(',');
+        return v[0]&&v[1]?[Number(v[0]),Number(v[1])]:[NaN,NaN];
+      });
+      if(c.length<2||c.some(p=>!p.every(Number.isFinite)||Math.abs(p[0])>180||Math.abs(p[1])>90)) continue;
+      const coords=c.filter((p,i)=>!i||p[0]!==c[i-1][0]||p[1]!==c[i-1][1]);
+      if(coords.length>=2) parts.push({route,coords});
+    }
+  }
+  return parts;
+}
+function geometryKey(route,coords){
+  let a=2166136261,b=5381;
+  const s=JSON.stringify([route,coords]);
+  for(let i=0;i<s.length;i++){
+    a=Math.imul(a^s.charCodeAt(i),16777619);
+    b=Math.imul(b,33)^s.charCodeAt(i);
+  }
+  return (a>>>0).toString(36)+'-'+(b>>>0).toString(36);
+}
+function adjacent(a,b){
+  const [x,y,X,Y]=a.box,[u,v,U,V]=b.box;
+  const dy=30/111000,dx=dy/Math.max(.2,Math.cos((y+Y)/2*Math.PI/180));
+  if(X+dx<u||U+dx<x||Y+dy<v||V+dy<y) return false;
+  return turf.lineIntersect(a.line,b.line).features.length>0||
+    a.coords.some(p=>turf.pointToLineDistance(p,b.line,meters)<=30)||
+    b.coords.some(p=>turf.pointToLineDistance(p,a.line,meters)<=30);
+}
+async function loadRoutes(){
+  const files=JSON.parse(await readText('list.json'));
+  if(!Array.isArray(files)||!files.length) throw new Error('list.json にKML名がありません');
+  const groups=new Map(),errors=[];
+  for(const file of new Set(files)){
+    try{
+      if(typeof file!=='string'||!file.toLowerCase().endsWith('.kml')||
+        file.split('/').some(p=>!p||p==='.'||p==='..'||p.includes('\\'))){
+        throw new Error('KML名が不正です');
+      }
+      const url='./'+file.split('/').map(encodeURIComponent).join('/');
+      const parts=parseKml(await readText(url),file);
+      if(!parts.length) throw new Error('LineStringがありません');
+      for(const part of parts){
+        const line=turf.lineString(part.coords),length=turf.length(line,meters);
+        const id=geometryKey(part.route,part.coords);
+        if(!length||routeById.has(id)) continue;
+        const r={...part,id,file,line,length,box:turf.bbox(line),slices:new Map()};
+        routes.push(r);routeById.set(id,r);
+        if(!groups.has(r.route)) groups.set(r.route,[]);
+        groups.get(r.route).push(r);
+      }
+    }catch(e){errors.push(`${file}：${e.message}`);}
+  }
+  if(!routes.length) throw new Error(`KMLの路線を読み込めません。\n${errors.join('\n')}`);
+
+  const assigned=[],layers=[];
+  for(const [name,parts] of groups){
+    const used=new Set(assigned
+      .filter(g=>parts.some(a=>g.parts.some(b=>adjacent(a,b)))).map(g=>g.color));
+    let color=COLORS.find(c=>!used.has(c));
+    for(let i=0;!color;i++){
+      const c=`hsl(${(i*137.508)%360},72%,37%)`;
+      if(!used.has(c)) color=c;
+    }
+    assigned.push({parts,color});
+    const label=name.match(/(\d+(?:[-−]\d+)?)\s*号線/)?.[1]||
+      name.match(/\d+/)?.[0]||name.slice(0,3);
+    const spots=[],placed=[];
+    for(const r of parts){
+      const layer=L.polyline(r.coords.map(ll),{
+        pane:'roads',color,weight:5,opacity:.65,interactive:false
+      }).addTo(map);
+      layers.push(layer);
+      spots.push({p:r.coords[0],end:true},{p:r.coords.at(-1),end:true});
+      for(let d=LABEL_INTERVAL;d<r.length;d+=LABEL_INTERVAL){
+        spots.push({p:turf.along(r.line,d,meters).geometry.coordinates,end:false});
+      }
+    }
+    spots.sort((a,b)=>Number(b.end)-Number(a.end));
+    for(const {p} of spots){
+      if(placed.some(q=>turf.distance(p,q,meters)<25)) continue;
+      placed.push(p);
+      const div=document.createElement('div');
+      div.className='route-label';div.style.borderColor=color;div.textContent=label;
+      L.marker(ll(p),{pane:'labels',interactive:false,icon:L.divIcon({
+        className:'',html:div,iconSize:[29,28],iconAnchor:[14,14]
+      })}).addTo(map);
+    }
+  }
+  map.fitBounds(L.featureGroup(layers).getBounds(),{maxZoom:17});
+  return errors;
+}
+
+const sectionKey=(r,i)=>`${r.id}:${i}`;
+const laneKey=(d,n)=>`${d}${n}`;
+function sectionLine(r,i){
+  if(r.slices.has(i)) return r.slices.get(i);
+  const a=i*UNIT,b=Math.min((i+1)*UNIT,r.length);
+  if(a>=b) return null;
+  const line=turf.lineSliceAlong(r.line,a/1000,b/1000,{units:'kilometers'});
+  r.slices.set(i,line);
+  return line;
+}
+function laneOffsets(m,d,n){
+  if(m==='oneway') return [-LANE_WIDTH/2,LANE_WIDTH/2];
+  // KML座標の順が往路。各方向とも進行方向の左端がNo.1。
+  const k=Number(m)-n;
+  return d==='F'?[k*LANE_WIDTH,(k+1)*LANE_WIDTH]:
+    [-(k+1)*LANE_WIDTH,-k*LANE_WIDTH];
+}
+function lanePolygon(line,m,d,n){
+  const c=line.geometry.coordinates,[lo,hi]=laneOffsets(m,d,n);
+  const shift=off=>c.map((p,i)=>{
+    if(!off) return p.slice(0,2);
+    let a=c[Math.max(0,i-1)],b=c[Math.min(c.length-1,i+1)];
+    if(a[0]===b[0]&&a[1]===b[1]){
+      if(i+1<c.length){a=p;b=c[i+1];}
+      else{a=c[i-1];b=p;}
+    }
+    return turf.destination(p,Math.abs(off),turf.bearing(a,b)+(off>0?-90:90),meters)
+      .geometry.coordinates;
+  });
+  const ring=shift(lo).concat(shift(hi).reverse());
+  ring.push(ring[0]);
+  return ring;
+}
+function laneShapes(r,i,record,fn){
+  const line=sectionLine(r,i);
+  if(!line||!record?.mode) return;
+  const dirs=record.mode==='oneway'?['O']:['F','R'];
+  const count=record.mode==='oneway'?1:Number(record.mode);
+  for(const d of dirs) for(let n=1;n<=count;n++){
+    fn(lanePolygon(line,record.mode,d,n),!!record.done[laneKey(d,n)],d,n);
+  }
+}
+function merged(key){
+  const past=inherited.get(key),now=job?.sections[key];
+  if(!now) return past;
+  return {mode:now.mode,done:{...(past?.mode===now.mode?past.done:{}),...now.done}};
+}
+function redrawSection(key){
+  const old=painted.get(key);
+  if(old){laneLayer.removeLayer(old);painted.delete(key);}
+  const [id,index]=key.split(':'),r=routeById.get(id),record=merged(key);
+  if(!r||!record) return;
+  const group=L.layerGroup();
+  laneShapes(r,Number(index),record,(ring,done)=>{
+    L.polygon(ring.map(ll),{
+      pane:'lanes',color:'#171717',weight:1,fillColor:done?'#ffe129':'#fff',
+      fillOpacity:1,interactive:false,smoothFactor:0
+    }).addTo(group);
+  });
+  group.addTo(laneLayer);painted.set(key,group);
+}
+function redrawAll(){
+  laneLayer.clearLayers();painted.clear();
+  for(const key of new Set([...inherited.keys(),...Object.keys(job?.sections||{})])){
+    redrawSection(key);
+  }
+}
+function showCurrent(hit,dir){
+  currentLane.clearLayers();
+  if(!hit||!dir||!lane) return;
+  const line=sectionLine(hit.r,hit.i);
+  if(!line) return;
+  L.polygon(lanePolygon(line,mode,dir,lane).map(ll),{
+    pane:'highlight',color:'#1265d8',weight:2.5,fill:false,interactive:false,smoothFactor:0
+  }).addTo(currentLane);
+}
+
+function rebuildHistory(){
+  inherited.clear();
+  for(const h of history.slice().sort((a,b)=>a.end-b.end)){
+    if(!selected.has(h.id)) continue;
+    for(const [key,rec] of Object.entries(h.sections||{})){
+      if(!routeById.has(key.split(':')[0])) continue;
+      const old=inherited.get(key);
+      inherited.set(key,{mode:rec.mode,done:{...(old?.mode===rec.mode?old.done:{}),...rec.done}});
+    }
+  }
+  redrawAll();
+}
+function showHistory(){
+  const box=$('historyChoices');box.replaceChildren();
+  for(const h of history.slice().sort((a,b)=>b.end-a.end)){
+    const label=document.createElement('label');
+    const input=document.createElement('input'),span=document.createElement('span');
+    input.type='checkbox';input.value=h.id;input.checked=selected.has(h.id);
+    span.textContent=`${when(h.end)}｜${h.name||'路線踏査'}｜${Object.keys(h.sections||{}).length}区間`;
+    label.append(input,span);box.append(label);
+  }
+  if(!box.children.length) box.textContent='この端末に引き継げる5m版の記録はありません。';
+  $('applyHistory').disabled=!history.length;
+  $('historyDialog').showModal();
+}
+function chooseHistory(use){
+  selected=new Set(use?[...$('historyChoices').querySelectorAll('input:checked')].map(c=>c.value):[]);
+  rebuildHistory();$('historyDialog').close();
+  const stale=history.filter(h=>selected.has(h.id)).flatMap(h=>Object.keys(h.sections||{}))
+    .filter(k=>!routeById.has(k.split(':')[0])).length;
+  msg(use?`色塗りを ${selected.size} 件引き継ぎました。${stale?`\nKMLが変わった ${stale} 区間は表示しません。`:''}`:
+    '過去の色塗りを表示せず、新規調査を始められます。');
+}
+$('history').onclick=showHistory;
+$('applyHistory').onclick=()=>chooseHistory(true);
+$('fresh').onclick=()=>chooseHistory(false);
+
+function controls(){
+  $('start').disabled=!ready||!!job||!!recovered||busy||!!volatileResult;
+  $('finish').disabled=!job||busy;
+  $('checkpoint').disabled=!job||busy;
+  $('history').disabled=!ready||!!job||busy;
+  $('recovery').hidden=!recovered;
+  $('resume').disabled=!ready||busy;
+  $('discard').disabled=busy;
+  for(const [type,z] of Object.entries(ZONES)){
+    $(type).disabled=!job||busy||!!activeZone&&activeZone.type!==type;
+    $(type).textContent=`${z.name} ${activeZone?.type===type?'終了':'開始'}`;
+  }
+  for(const b of $('counts').querySelectorAll('button')){
+    b.disabled=!!recovered||busy;
+    b.setAttribute('aria-pressed',String(b.dataset.mode===mode));
+  }
+  for(const b of $('lanes').querySelectorAll('button')){
+    b.disabled=busy||!!recovered||mode==='oneway'||Number(b.dataset.lane)>Number(mode);
+    b.setAttribute('aria-pressed',String(Number(b.dataset.lane)===lane));
+  }
+}
+function resetMatch(){
+  previous=null;dirState=null;latest=null;currentLane.clearLayers();
+}
+function breakTrack(){
+  resetMatch();trackLine=null;activePaths={};
+}
+function inputChanged(){
+  settingsVersion++;
+  if(job){job.mode=mode;job.lane=lane;dirty=true;}
+  resetMatch();
+  $('roadStatus').textContent=job?
+    `${modeName(mode)}｜${lane?`車線No.${lane}`:'車線未選択'}｜測位待ち`:
+    '待機中｜調査開始を押してください';
+  controls();
+}
+$('counts').onclick=e=>{
+  const b=e.target.closest('[data-mode]');
+  if(!b||b.disabled||mode===b.dataset.mode) return;
+  mode=b.dataset.mode;lane=mode==='oneway'?1:0;inputChanged();
+};
+$('lanes').onclick=e=>{
+  const b=e.target.closest('[data-lane]');
+  if(!b||b.disabled) return;
+  const n=Number(b.dataset.lane);
+  lane=lane===n?0:n;inputChanged();
+};
+$('follow').onclick=()=>{
+  follow=!follow;
+  $('follow').setAttribute('aria-pressed',String(follow));
+  $('follow').textContent=`現在地追従：${follow?'ON':'OFF'}`;
+  if(follow&&marker) map.panTo(marker.getLatLng());
+};
+
+function locate(p){
+  const dy=NEAR*1.5/111000,dx=dy/Math.max(.2,Math.cos(p[1]*Math.PI/180));
+  const hits=[];
+  for(const r of routes){
+    const [x,y,X,Y]=r.box;
+    if(p[0]<x-dx||p[0]>X+dx||p[1]<y-dy||p[1]>Y+dy) continue;
+    const h=turf.nearestPointOnLine(r.line,p,meters).properties;
+    if(h.dist<=NEAR&&Number.isFinite(h.location)){
+      const at=Math.max(0,Math.min(h.location,r.length));
+      const i=Math.min(Math.ceil(r.length/UNIT)-1,Math.floor(at/UNIT));
+      hits.push({r,d:h.dist,at,i});
+    }
+  }
+  hits.sort((a,b)=>a.d-b.d);
+  if(!hits.length) return {kind:'outside',hit:null};
+  if(hits[1]&&hits[1].d-hits[0].d<ROUTE_MARGIN) return {kind:'ambiguous',hit:null};
+  return {kind:'ok',hit:hits[0]};
+}
+function matchDirection(hit,time){
+  const old=previous;
+  previous={...hit,time,setting:settingsVersion};
+  const oneway=mode==='oneway'?'O':'';
+  if(!old||old.r.id!==hit.r.id||old.setting!==settingsVersion||
+    time<=old.time||time-old.time>MAX_GAP){
+    dirState=null;return {dir:oneway,from:null,layoutFrom:null};
+  }
+
+  const delta=hit.at-old.at,abs=Math.abs(delta);
+  if(abs>MAX_JUMP||abs/((time-old.time)/1000)>MAX_SPEED){
+    dirState=null;return {dir:oneway,from:null,layoutFrom:null};
+  }
+  if(abs<DIR_MOVE){
+    if(dirState&&time-dirState.lastMove>5000) dirState=null;
+    return {dir:oneway||dirState?.confirmed||'',from:null,layoutFrom:null};
+  }
+  if(oneway) return {dir:'O',from:old.at,layoutFrom:old.at};
+
+  const sign=delta>0?'F':'R';
+  if(!dirState||dirState.sign!==sign){
+    dirState={sign,steps:1,distance:abs,from:old.at,lastMove:time,confirmed:''};
+  }else{
+    dirState.steps++;dirState.distance+=abs;dirState.lastMove=time;
+  }
+  if(dirState.confirmed) return {dir:sign,from:old.at,layoutFrom:old.at};
+  if(dirState.steps>=DIR_STREAK&&dirState.distance>=DIR_DISTANCE){
+    dirState.confirmed=sign;
+    return {dir:sign,from:dirState.from,layoutFrom:old.at};
+  }
+  return {dir:'',from:null,layoutFrom:old.at};
+}
+function visitSection(r,i,dir,time,changed){
+  const key=sectionKey(r,i);
+  let rec=job.sections[key];
+  if(rec?.mode!==mode){
+    rec=job.sections[key]={mode,done:{}};
+    changed.add(key);
+  }
+  if(dir&&lane){
+    const k=laneKey(dir,lane);
+    if(!rec.done[k]){rec.done[k]=time;changed.add(key);}
+  }
+}
+function forRange(r,from,to,fn){
+  if(from===null||from===to) return;
+  const lo=Math.min(from,to),hi=Math.max(from,to);
+  const first=Math.max(0,Math.floor(lo/UNIT));
+  const last=Math.min(Math.ceil(r.length/UNIT)-1,Math.ceil(hi/UNIT)-1);
+  for(let i=first;i<=last;i++) fn(i);
+}
+function updateSections(hit,result,time){
+  const changed=new Set();
+  visitSection(hit.r,hit.i,'',time,changed);
+  // 有効な連続測位間を補間し、No.未選択でも白い枠を表示する。
+  forRange(hit.r,result.layoutFrom,hit.at,i=>visitSection(hit.r,i,'',time,changed));
+  // 選択車線と方向が確定した範囲だけ黄色にする。
+  if(lane&&result.dir){
+    forRange(hit.r,result.from,hit.at,i=>visitSection(hit.r,i,result.dir,time,changed));
+  }
+  if(changed.size) dirty=true;
+  for(const key of changed) redrawSection(key);
+}
+
+function trackPoint(row){
+  const last=job.points.at(-1);
+  if(last&&row.time-last.time>MAX_GAP){trackLine=null;activePaths={};}
+  if(trackLine&&last&&last.route===row.route&&last.dir===row.dir&&last.mode===row.mode&&
+    last.lane===row.lane&&turf.distance(last.xy,row.xy,meters)<2&&row.time-last.time<5000) return;
+  if(!trackLine){
+    job.paths.push([row.xy]);
+    trackLine=L.polyline([ll(row.xy)],{
+      pane:'tracks',color:'#40444b',weight:3,dashArray:'4 5',interactive:false
+    }).addTo(tracks);
+  }else{
+    job.paths.at(-1).push(row.xy);
+    trackLine.addLatLng(ll(row.xy));
+  }
+  job.points.push(row);dirty=true;
+  if(activeZone){
+    if(!activePaths[activeZone.type]){
+      activePaths[activeZone.type]=[];
+      activeZone.paths.push(activePaths[activeZone.type]);
+    }
+    activePaths[activeZone.type].push(row.xy);
+    activeZone.last=row;
+  }
+  renderList();
+}
+function onPosition(pos){
+  if(!job||busy||document.hidden) return;
+  const {longitude,latitude,accuracy}=pos.coords,time=pos.timestamp;
+  if(!Number.isFinite(time)||time<job.acceptAfter||(job.lastFix&&time<=job.lastFix)) return;
+  const p=[longitude,latitude];
+  if(!p.every(Number.isFinite)) return;
+  if(job.lastFix&&time-job.lastFix>MAX_GAP) breakTrack();
+  job.lastFix=time;
+
+  if(!marker){
+    marker=L.marker(ll(p),{pane:'position',interactive:false,icon:L.divIcon({
+      className:'',html:'<div class="dot"></div>',iconSize:[17,17],iconAnchor:[8,8]
+    })}).addTo(map);
+    accuracyCircle=L.circle(ll(p),{
+      pane:'roads',radius:0,weight:1,color:'#dc2626',fillOpacity:.06,interactive:false
+    }).addTo(map);
+  }
+  marker.setLatLng(ll(p));
+  accuracyCircle.setLatLng(ll(p)).setRadius(Number.isFinite(accuracy)?accuracy:0);
+  if(follow) map.panTo(ll(p),{animate:false});
+
+  if(!Number.isFinite(accuracy)||accuracy>MAX_ACCURACY){
+    breakTrack();
+    $('gpsStatus').textContent='GPS精度が低いため、新たな色塗りを保留しています。';
+    $('roadStatus').textContent='道路判定待ち';
+    return;
+  }
+
+  $('gpsStatus').textContent='';
+  const {kind,hit}=locate(p);
+  let dir='';
+  if(hit){
+    const result=matchDirection(hit,time);
+    dir=result.dir;
+    updateSections(hit,result,time);
+    showCurrent(hit,dir);
+    $('roadStatus').textContent=
+      `${hit.r.route}｜${hit.i+1}番（5m区間）｜${dirName(dir)}｜${modeName(mode)}｜${lane?`No.${lane}`:'車線未選択'}`;
+  }else{
+    resetMatch();
+    $('roadStatus').textContent=kind==='ambiguous'?'道路判定中：近接する候補が複数':'路線外';
+  }
+  latest={time,xy:p,acc:accuracy,route:hit?.r.route||
+    (kind==='ambiguous'?'道路判定中':'路線外'),dir,mode,lane,section:hit?hit.i+1:''};
+  trackPoint(latest);
+}
+function startGPS(){
+  if(watchId!==null||!job) return;
+  if(!window.isSecureContext||!navigator.geolocation){
+    $('gpsStatus').textContent='位置情報に対応したブラウザでHTTPSのページを開いてください。';
+    return;
+  }
+  const epoch=++watchEpoch;
+  watchId=navigator.geolocation.watchPosition(
+    p=>{if(epoch===watchEpoch) onPosition(p);},
+    e=>{
+      if(epoch!==watchEpoch||!job) return;
+      breakTrack();$('gpsStatus').textContent=`位置情報：${e.message}`;
+    },
+    {enableHighAccuracy:true,maximumAge:0,timeout:15000}
+  );
+}
+async function lockScreen(){
+  if(!job||document.hidden||!navigator.wakeLock||(wake&&!wake.released)) return;
+  const session=job;
+  try{
+    const lock=await navigator.wakeLock.request('screen');
+    if(job!==session||document.hidden||(wake&&!wake.released)) await lock.release();
+    else wake=lock;
+  }catch{}
+}
+function stopGPS(){
+  watchEpoch++;
+  if(watchId!==null) navigator.geolocation.clearWatch(watchId);
+  watchId=null;
+  if(wake){wake.release().catch(()=>{});wake=null;}
+}
+
+function drawZone(z){
+  for(const p of z.paths){
+    if(!p.length) continue;
+    const style={pane:'zones',color:ZONES[z.type].color,weight:6};
+    const shape=p.length===1?L.circleMarker(ll(p[0]),{...style,radius:5}):
+      L.polyline(p.map(ll),style);
+    const label=document.createElement('div');
+    label.textContent=`${ZONES[z.type].name}${z.reason?`（${z.reason}）`:''}｜${when(z.start.time)} ～ ${when(z.last.time)}`;
+    shape.bindPopup(label).addTo(zones);
+  }
+}
+function finishZone(){
+  if(!activeZone) return;
+  job.zones.push(activeZone);
+  drawZone(activeZone);
+  activeZone=null;activePaths={};dirty=true;controls();
+}
+function openChoice(dialog){
+  return new Promise(resolve=>{
+    dialog.returnValue='';
+    dialog.addEventListener('close',()=>resolve(dialog.returnValue),{once:true});
+    dialog.showModal();
+  });
+}
+async function toggleZone(type){
+  if(!job||busy) return;
+  if(activeZone){
+    if(activeZone.type===type){finishZone();saveDraft();}
+    return;
+  }
+  if(!latest||Date.now()-latest.time>MAX_GAP){
+    alert('有効な現在地を取得してから押してください。');return;
+  }
+  const session=job;
+  const reason=type==='detour'?await openChoice($('reasonDialog')):'';
+  if(job!==session||busy||activeZone||(type==='detour'&&!reason)) return;
+  if(!latest||Date.now()-latest.time>MAX_GAP){
+    alert('現在地の再取得後に操作してください。');return;
+  }
+  const path=[latest.xy];
+  activeZone={type,reason,start:latest,last:latest,paths:[path]};
+  activePaths[type]=path;dirty=true;controls();saveDraft();
+}
+$('construction').onclick=()=>toggleZone('construction');
+$('detour').onclick=()=>toggleZone('detour');
+
+function saveDraft(manual=false){
+  if(!job) return Promise.resolve(false);
+  const session=job;
+  let snapshot;
+  try{
+    snapshot=structuredClone({job,activeZone,selected:[...selected],saved:Date.now()});
+  }catch(e){
+    $('saveStatus').textContent='途中記録を準備できません。画面を閉じないでください。';
+    return Promise.resolve(false);
+  }
+  dirty=false;
+  return dbWrite(['meta'],tx=>tx.objectStore('meta').put(snapshot,'draft')).then(()=>{
+    if(job===session) $('saveStatus').textContent=`${manual?'途中保存':'自動保存'}済み：${when(snapshot.saved)}`;
+    return true;
+  }).catch(e=>{
+    if(job===session){
+      dirty=true;
+      $('saveStatus').textContent=`途中保存に失敗：${e.message}。画面を閉じないでください。`;
+    }
+    return false;
+  });
+}
+$('checkpoint').onclick=()=>saveDraft(true);
+setInterval(()=>{if(job&&dirty&&!busy&&!document.hidden) saveDraft();},10000);
+document.addEventListener('visibilitychange',()=>{
+  if(!job||busy) return;
+  breakTrack();
+  if(document.hidden) saveDraft();
+  else{job.acceptAfter=Date.now();lockScreen();}
+});
+window.addEventListener('pagehide',()=>{if(job&&!busy) saveDraft();});
+
+$('start').onclick=()=>{
+  if(!ready||job||busy||recovered||volatileResult) return;
+  if(!window.isSecureContext||!navigator.geolocation){
+    msg('HTTPSで開き、端末の位置情報を許可してください。');return;
+  }
+  const at=Date.now();
+  const suffix=crypto.randomUUID().slice(0,8);
+  job={id:`${stamp(at)}_${suffix}`,unit:UNIT,start:at,end:null,acceptAfter:at,lastFix:0,
+    mode,lane,points:[],paths:[],sections:{},zones:[]};
+  activeZone=null;tracks.clearLayers();zones.clearLayers();
+  breakTrack();redrawAll();
+  $('roadStatus').textContent='調査中｜測位待ち';msg('');
+  controls();startGPS();lockScreen();saveDraft();renderList();
+};
+$('resume').onclick=()=>{
+  if(!ready||!recovered||busy) return;
+  job=recovered.job;activeZone=recovered.activeZone;
+  selected=new Set(recovered.selected||[]);
+  mode=['oneway','1','2','3','4'].includes(job.mode)?job.mode:'1';
+  lane=mode==='oneway'?1:Number.isInteger(job.lane)&&job.lane>=1&&job.lane<=Number(mode)?job.lane:0;
+  job.mode=mode;job.lane=lane;job.acceptAfter=Date.now();job.lastFix=0;
+  recovered=null;breakTrack();rebuildHistory();
+  tracks.clearLayers();zones.clearLayers();
+  for(const p of job.paths){
+    L.polyline(p.map(ll),{pane:'tracks',color:'#40444b',weight:3,dashArray:'4 5',interactive:false}).addTo(tracks);
+  }
+  for(const z of job.zones) drawZone(z);
+  $('roadStatus').textContent='前回の調査を再開｜測位待ち';
+  msg('中断前と再開後の軌跡は別の線として記録します。');
+  controls();renderList();startGPS();lockScreen();saveDraft();
+};
+$('discard').onclick=async()=>{
+  if(!recovered||busy||!confirm('途中記録を破棄しますか？ 保存済みの調査履歴は残ります。')) return;
+  busy=true;controls();
+  try{
+    await dbWrite(['meta'],tx=>tx.objectStore('meta').delete('draft'));
+    recovered=null;$('saveStatus').textContent='途中記録を破棄しました。';
+  }catch(e){msg(e.message);}
+  finally{busy=false;controls();}
+};
+
+const LOG_HEAD=['測位日時','路線','5m区間No.','方向','車線構成','通過車線No.','緯度','経度','GPS精度(m)'];
+const logRow=p=>[
+  when(p.time),p.route,p.section,p.dir?dirName(p.dir):'',modeName(p.mode),p.lane||'',
+  Number(p.xy[1].toFixed(7)),Number(p.xy[0].toFixed(7)),Math.round(p.acc)
+];
+const ZONE_HEAD=['種別','理由','開始時刻','終了時刻','開始緯度','開始経度','終了緯度','終了経度'];
+const zoneRow=z=>[
+  ZONES[z.type].name,z.reason,when(z.start.time),when(z.last.time),
+  z.start.xy[1],z.start.xy[0],z.last.xy[1],z.last.xy[0]
+];
+function workbook(s){
+  const wb=XLSX.utils.book_new();
+  const add=(name,rows)=>XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(rows),name);
+  add('調査概要',[['項目','内容'],['調査ID',s.id],['開始',when(s.start)],
+    ['終了',when(s.end)],['測位記録数',s.points.length],['区間単位(m)',UNIT]]);
+  add('経路一覧',[LOG_HEAD,...s.points.map(logRow)]);
+  add('工事・迂回',[ZONE_HEAD,...s.zones.map(zoneRow)]);
+  const rows=[['路線','元KML','5m区間No.','起点から(m)','終点まで(m)',
+    '車線構成','方向','車線No.','今回の初回通過時刻']];
+  for(const [key,rec] of Object.entries(s.sections)){
+    const [id,index]=key.split(':'),r=routeById.get(id),i=Number(index);
+    for(const [k,time] of Object.entries(rec.done)){
+      rows.push([r?.route||id,r?.file||'',i+1,i*UNIT,
+        r?Number(Math.min(r.length,(i+1)*UNIT).toFixed(2)):'',
+        modeName(rec.mode),dirName(k[0]),Number(k.slice(1)),when(time)]);
+    }
+  }
+  add('今回の車線踏査',rows);
+  return wb;
+}
+function makeKml(s){
+  const coords=p=>p.map(c=>`${c[0]},${c[1]},0`).join(' ');
+  function path(name,p,color){
+    if(!p.length) return '';
+    const geom=p.length===1?
+      `<Point><coordinates>${coords(p)}</coordinates></Point>`:
+      `<LineString><tessellate>1</tessellate><coordinates>${coords(p)}</coordinates></LineString>`;
+    return `<Placemark><name>${xml(name)}</name><Style><LineStyle><color>${color}</color><width>4</width></LineStyle></Style>${geom}</Placemark>`;
+  }
+  const parts=[
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>',
+    `<name>${xml(s.id)} 路線踏査・5m</name>`,
+    '<Style id="done"><LineStyle><color>ff171717</color><width>1</width></LineStyle><PolyStyle><color>ff29e1ff</color></PolyStyle></Style>',
+    '<Style id="white"><LineStyle><color>ff171717</color><width>1</width></LineStyle><PolyStyle><color>ffffffff</color></PolyStyle></Style>',
+    '<Folder><name>今回の車線・5m区間</name>'
+  ];
+  for(const [key,rec] of Object.entries(s.sections)){
+    const [id,index]=key.split(':'),r=routeById.get(id),i=Number(index);
+    if(!r) continue;
+    laneShapes(r,i,rec,(ring,done,d,n)=>{
+      const name=`${r.route}｜5m区間${i+1}｜${dirName(d)}｜No.${n}｜${done?'今回踏査済み':'今回未踏査'}`;
+      parts.push(`<Placemark><name>${xml(name)}</name><styleUrl>#${done?'done':'white'}</styleUrl><Polygon><outerBoundaryIs><LinearRing><coordinates>${coords(ring)}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>`);
+    });
+  }
+  parts.push('</Folder>','<Folder><name>今回のGPS軌跡</name>');
+  for(const [i,p] of s.paths.entries()) parts.push(path(`踏査軌跡 ${i+1}`,p,'ff333333'));
+  parts.push('</Folder>','<Folder><name>工事・迂回</name>');
+  for(const z of s.zones){
+    for(const p of z.paths){
+      parts.push(path(`${ZONES[z.type].name}${z.reason?`（${z.reason}）`:''}`,p,ZONES[z.type].kml));
+    }
+  }
+  parts.push('</Folder></Document></kml>');
+  return new Blob(parts,{type:'application/vnd.google-earth.kml+xml'});
+}
+function currentSurvey(){
+  return job||volatileResult?.survey||pending?.survey||null;
+}
+function renderList(){
+  if($('panel').hidden) return;
+  const points=currentSurvey()?.points||[];
+  $('summary').textContent=`経路 ${points.length} 件（最新300件）`;
+  const table=document.createElement('table'),head=table.createTHead().insertRow();
+  for(const value of LOG_HEAD){
+    const cell=document.createElement('th');cell.textContent=value;head.append(cell);
+  }
+  const body=table.createTBody();
+  for(const p of points.slice(-300).reverse()){
+    const row=body.insertRow();
+    for(const value of logRow(p)) row.insertCell().textContent=value;
+  }
+  $('tableArea').replaceChildren(table);
+}
+$('listButton').onclick=()=>{$('panel').hidden=!$('panel').hidden;renderList();};
+$('closeList').onclick=()=>{$('panel').hidden=true;};
+$('exportList').onclick=()=>{
+  const s=currentSurvey();
+  if(!s){msg('今回の経路記録がありません。');return;}
+  try{XLSX.writeFile(workbook(s),`経路一覧_${s.id}.xlsx`);}
+  catch(e){msg(`Excelを出力できません：${e.message}`);}
+};
+
+function base64(blob){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=()=>resolve(String(reader.result).split(',')[1]);
+    reader.onerror=()=>reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+async function upload(file,credential){
+  const path=[FOLDER,file.name].map(encodeURIComponent).join('/');
+  const url=`https://api.github.com/repos/${OWNER}/${REPO}/contents/${path}`;
+  const auth={Authorization:`Bearer ${credential}`};
+  const headers={...auth,Accept:'application/vnd.github+json','Content-Type':'application/json'};
+  const content=await base64(file.blob);
+  const check=url+`?ref=${encodeURIComponent(BRANCH)}`;
+  const old=await fetch(check,{headers,cache:'no-store'});
+  if(old.ok){
+    const meta=await old.json();
+    if(meta.encoding==='base64'&&meta.content?.replace(/\s/g,'')===content) return;
+    if(meta.size===file.blob.size){
+      const raw=await fetch(check,{
+        headers:{...auth,Accept:'application/vnd.github.raw+json'},cache:'no-store'
+      });
+      if(raw.ok&&await base64(await raw.blob())===content) return;
+    }
+    throw new Error(`${file.name}：同名の異なるファイルは上書きしません`);
+  }
+  if(old.status!==404) throw new Error(`既存ファイルを確認できません：HTTP ${old.status}`);
+  const r=await fetch(url,{method:'PUT',headers,body:JSON.stringify({
+    message:`踏査記録：${file.name}`,branch:BRANCH,content
+  })});
+  if(!r.ok) throw new Error(`${file.name}：HTTP ${r.status}。保存先と書き込み権限を確認してください。`);
+}
+async function setToken(){
+  if($('tokenDialog').open) return;
+  $('pat').value='';
+  const choice=await openChoice($('tokenDialog'));
+  if(choice==='set') token=$('pat').value.trim();
+  if(choice==='clear') token='';
+  $('pat').value='';
+}
+$('tokenSettings').onclick=setToken;
+async function sendPending(){
+  if(busy||!pending||pending.index>=pending.files.length) return;
+  if(!token) await setToken();
+  if(!token||!pending||busy) return;
+  const credential=token,p=pending;
+  busy=true;controls();
+  try{
+    while(p.index<p.files.length){
+      msg(`GitHubへ保存中：${p.index+1}/${p.files.length}`);
+      await upload(p.files[p.index],credential);
+      const next=p.index+1;
+      await dbWrite(['meta'],tx=>tx.objectStore('meta').put({...p,index:next},'pending'));
+      p.index=next;
+    }
+    msg(`GitHubの ${FOLDER} に保存しました。`);
+  }catch(e){
+    msg(`GitHubへの保存を完了できませんでした。\n${e.message}\n端末保存は残っています。`);
+  }finally{busy=false;controls();showDownloads();}
+}
+function showDownloads(){
+  const box=$('downloads');box.replaceChildren();
+  const old=downloadURLs;downloadURLs=[];
+  setTimeout(()=>old.forEach(u=>URL.revokeObjectURL(u)),60000);
+  const result=volatileResult||pending;
+  if(!result) return;
+
+  for(const f of result.files){
+    const a=document.createElement('a'),url=URL.createObjectURL(f.blob);
+    a.href=url;a.download=f.name;a.textContent=`${f.kind}を保存`;
+    box.append(a);downloadURLs.push(url);
+  }
+  const files=result.files.map(f=>new File([f.blob],f.name,{type:f.blob.type}));
+  if(navigator.canShare?.({files})){
+    const button=document.createElement('button');button.textContent='まとめて共有';
+    button.onclick=()=>navigator.share({files,title:'踏査結果'}).catch(e=>{
+      if(e.name!=='AbortError') msg('共有できない場合は各ファイルの保存リンクを使ってください。');
+    });
+    box.append(button);
+  }
+  if(volatileResult){
+    const b=document.createElement('button');b.textContent='端末保存を再試行';
+    b.onclick=()=>commitResult(volatileResult);box.append(b);
+  }else if(pending.index<pending.files.length){
+    const b=document.createElement('button');b.textContent='GitHubへ保存／再試行';
+    b.onclick=sendPending;box.append(b);
+  }
+}
+async function commitResult(result){
+  if(!result||busy) return;
+  busy=true;controls();
+  try{
+    await dbWrite(['meta','surveys'],tx=>{
+      tx.objectStore('surveys').put(result.history);
+      tx.objectStore('meta').put(result,'pending');
+      tx.objectStore('meta').delete('draft');
+    });
+    history=history.filter(h=>h.id!==result.history.id);
+    history.push(result.history);
+    selected.add(result.history.id);
+    pending=result;volatileResult=null;rebuildHistory();
+    $('saveStatus').textContent='今回の結果を端末に保存しました。';
+    msg('Excel・KMLの保存リンクからPCへ転送できます。必要な場合だけGitHubへ保存してください。');
+  }catch(e){
+    $('saveStatus').textContent=`端末履歴への保存に失敗：${e.message}`;
+    msg('画面を閉じずに、先にExcel・KMLを保存してから端末保存を再試行してください。');
+  }finally{busy=false;controls();showDownloads();renderList();}
+}
+$('finish').onclick=async()=>{
+  if(!job||busy) return;
+  if(pending&&pending.index<pending.files.length&&
+    !confirm('前回のファイルがGitHubに未送信です。今回の結果を確定すると保存リンクと送信待ちリストは今回分に置き換わります。続けますか？')) return;
+  if(!confirm('今回の調査を終了し、Excel・KMLと色塗りを保存しますか？')) return;
+
+  busy=true;controls();
+  try{
+    const s=job;
+    // 出力失敗時は調査を続けられるよう、コピーで出力を準備する。
+    const resultSurvey=structuredClone({...s,end:Date.now(),
+      zones:activeZone?[...s.zones,activeZone]:s.zones});
+    const name=[...new Set(s.points.map(p=>p.route).filter(r=>r!=='路線外'&&r!=='道路判定中'))]
+      .slice(0,3).join(' / ')||'路線踏査';
+    const record={id:s.id,unit:UNIT,name,end:resultSurvey.end,sections:resultSurvey.sections};
+    const xlsx=new Blob([XLSX.write(workbook(resultSurvey),{type:'array',bookType:'xlsx'})],{
+      type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    });
+    const files=[
+      {kind:'Excel',name:`踏査結果_${s.id}.xlsx`,blob:xlsx},
+      {kind:'KML',name:`踏査軌跡_${s.id}.kml`,blob:makeKml(resultSurvey)},
+      {kind:'車線記録JSON',name:`車線記録_${s.id}.json`,
+        blob:new Blob([JSON.stringify(record)],{type:'application/json'})}
+    ];
+    volatileResult={survey:resultSurvey,history:record,files,index:0};
+    if(activeZone) drawZone(activeZone);
+    activeZone=null;stopGPS();job=null;breakTrack();
+    $('roadStatus').textContent='調査終了';$('gpsStatus').textContent='';
+  }catch(e){
+    msg(`出力を作成できませんでした：${e.message}`);
+  }finally{busy=false;controls();}
+  if(volatileResult) await commitResult(volatileResult);
+};
+
+(async()=>{
+  try{
+    db=await openDB();
+    const [savedHistory,draft,savedPending]=await Promise.all([
+      dbRead('surveys'),dbRead('meta','draft'),dbRead('meta','pending')
+    ]);
+    history=savedHistory;pending=savedPending;
+    recovered=draft?.job?draft:null;
+    if(recovered) $('saveStatus').textContent=`前回の途中記録があります：${when(recovered.saved)}`;
+    showDownloads();
+    const errors=await loadRoutes();
+    ready=true;
+    $('roadStatus').textContent='待機中｜5m区間｜調査開始を押してください';
+    if(errors.length) msg(`一部のKMLを読み込めませんでした。\n${errors.join('\n')}`);
+    controls();
+    if(!recovered&&history.length) showHistory();
+  }catch(e){
+    $('roadStatus').textContent='起動できませんでした';
+    msg(`読み込みエラー：${e.message}`);
+  }finally{controls();}
+})();
+</script>
+</body>
+</html>
